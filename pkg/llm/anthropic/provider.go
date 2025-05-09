@@ -12,17 +12,19 @@ import (
 )
 
 type Provider struct {
-	client *Client
-	model  string
+	client       *Client
+	model        string
+	systemPrompt string
 }
 
-func NewProvider(apiKey string, baseURL string, model string) *Provider {
+func NewProvider(apiKey, baseURL, model, systemPrompt string) *Provider {
 	if model == "" {
 		model = "claude-3-5-sonnet-20240620" // 默认模型
 	}
 	return &Provider{
-		client: NewClient(apiKey, baseURL),
-		model:  model,
+		client:       NewClient(apiKey, baseURL),
+		model:        model,
+		systemPrompt: systemPrompt,
 	}
 }
 
@@ -95,7 +97,7 @@ func (p *Provider) CreateMessage(
 		// Always append the message, even if content is empty
 		// This maintains conversation flow
 		anthropicMessages = append(anthropicMessages, MessageParam{
-			Role:    msg.GetRole(),
+			Role:    mappingRole(msg.GetRole()),
 			Content: content,
 		})
 	}
@@ -135,6 +137,7 @@ func (p *Provider) CreateMessage(
 		Messages:  anthropicMessages,
 		MaxTokens: 4096,
 		Tools:     anthropicTools,
+		System:    p.systemPrompt,
 	})
 	if err != nil {
 		return nil, err
@@ -191,4 +194,22 @@ func (p *Provider) CreateToolResponse(
 	}
 
 	return msg, nil
+}
+
+const (
+	roleUser      = "user"
+	roleAssistant = "assistant"
+)
+
+var roleMap = map[string]string{
+	roleUser:      roleUser,
+	roleAssistant: roleAssistant,
+}
+
+func mappingRole(role string) string {
+	v, ok := roleMap[role]
+	if !ok {
+		return roleUser
+	}
+	return v
 }

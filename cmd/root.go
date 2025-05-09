@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/mark3labs/mcphost/pkg/history"
 	"github.com/mark3labs/mcphost/pkg/llm"
 	"github.com/mark3labs/mcphost/pkg/llm/anthropic"
+	"github.com/mark3labs/mcphost/pkg/llm/google"
 	"github.com/mark3labs/mcphost/pkg/llm/ollama"
 	"github.com/mark3labs/mcphost/pkg/llm/openai"
 	"github.com/spf13/cobra"
@@ -28,12 +30,14 @@ import (
 var (
 	renderer         *glamour.TermRenderer
 	configFile       string
+	systemPromptFile string
 	messageWindow    int
 	modelFlag        string // New flag for model selection
 	openaiBaseURL    string // Base URL for OpenAI API
 	anthropicBaseURL string // Base URL for Anthropic API
 	openaiAPIKey     string
 	anthropicAPIKey  string
+	googleAPIKey     string
 )
 
 const (
@@ -53,12 +57,14 @@ Available models can be specified using the --model flag:
 - Anthropic Claude (default): anthropic:claude-3-5-sonnet-latest
 - OpenAI: openai:gpt-4
 - Ollama models: ollama:modelname
+- Google: google:modelname
 
 Example:
   mcphost -m ollama:qwen2.5:3b
-  mcphost -m openai:gpt-4`,
+  mcphost -m openai:gpt-4
+  mcphost -m google:gemini-2.0-flash`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runMCPHost()
+		return runMCPHost(context.Background())
 	},
 }
 
@@ -72,7 +78,9 @@ var debugMode bool
 
 func init() {
 	rootCmd.PersistentFlags().
-		StringVar(&configFile, "config", "", "config file (default is $HOME/mcp.json)")
+		StringVar(&configFile, "config", "", "config file (default is $HOME/.mcp.json)")
+	rootCmd.PersistentFlags().
+		StringVar(&systemPromptFile, "system-prompt", "", "system prompt json file")
 	rootCmd.PersistentFlags().
 		IntVar(&messageWindow, "message-window", 10, "number of messages to keep in context")
 	rootCmd.PersistentFlags().
@@ -88,10 +96,11 @@ func init() {
 	flags.StringVar(&anthropicBaseURL, "anthropic-url", "", "base URL for Anthropic API (defaults to api.anthropic.com)")
 	flags.StringVar(&openaiAPIKey, "openai-api-key", "", "OpenAI API key")
 	flags.StringVar(&anthropicAPIKey, "anthropic-api-key", "", "Anthropic API key")
+	flags.StringVar(&googleAPIKey, "google-api-key", "", "Google (Gemini) API key")
 }
 
 // Add new function to create provider
-func createProvider(modelString string) (llm.Provider, error) {
+func createProvider(ctx context.Context, modelString, systemPrompt string) (llm.Provider, error) {
 	parts := strings.SplitN(modelString, ":", 2)
 	if len(parts) < 2 {
 		return nil, fmt.Errorf(
@@ -115,10 +124,10 @@ func createProvider(modelString string) (llm.Provider, error) {
 				"Anthropic API key not provided. Use --anthropic-api-key flag or ANTHROPIC_API_KEY environment variable",
 			)
 		}
-		return anthropic.NewProvider(apiKey, anthropicBaseURL, model), nil
+		return anthropic.NewProvider(apiKey, anthropicBaseURL, model, systemPrompt), nil
 
 	case "ollama":
-		return ollama.NewProvider(model)
+		return ollama.NewProvider(model, systemPrompt)
 
 	case "openai":
 		apiKey := openaiAPIKey
@@ -131,7 +140,18 @@ func createProvider(modelString string) (llm.Provider, error) {
 				"OpenAI API key not provided. Use --openai-api-key flag or OPENAI_API_KEY environment variable",
 			)
 		}
-		return openai.NewProvider(apiKey, openaiBaseURL, model), nil
+		return openai.NewProvider(apiKey, openaiBaseURL, model, systemPrompt), nil
+
+	case "google":
+		apiKey := googleAPIKey
+		if apiKey == "" {
+			apiKey = os.Getenv("GOOGLE_API_KEY")
+		}
+		if apiKey == "" {
+			// The project structure is provider specific, but Google calls this GEMINI_API_KEY in e.g. AI Studio. Support both.
+			apiKey = os.Getenv("GEMINI_API_KEY")
+		}
+		return google.NewProvider(ctx, apiKey, model, systemPrompt)
 
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", provider)
@@ -219,8 +239,9 @@ func updateRenderer() error {
 
 // Method implementations for simpleMessage
 func runPrompt(
+	ctx context.Context,
 	provider llm.Provider,
-	mcpClients map[string]*mcpclient.StdioMCPClient,
+	mcpClients map[string]mcpclient.MCPClient,
 	tools []llm.Tool,
 	prompt string,
 	messages *[]history.HistoryMessage,
@@ -255,7 +276,7 @@ func runPrompt(
 	for {
 		action := func() {
 			message, err = provider.CreateMessage(
-				context.Background(),
+				ctx,
 				prompt,
 				llmMessages,
 				tools,
@@ -294,7 +315,7 @@ func runPrompt(
 	var messageContent []history.ContentBlock
 
 	// Handle the message response
-	if str, err := renderer.Render("\nAssistant: "); err == nil {
+	if str, err := renderer.Render("\nAssistant: "); message.GetContent() != "" && err == nil {
 		fmt.Print(str)
 	}
 
@@ -413,10 +434,8 @@ func runPrompt(
 			var resultText string
 			// Handle array content directly since we know it's []interface{}
 			for _, item := range toolResult.Content {
-				if contentMap, ok := item.(map[string]interface{}); ok {
-					if text, ok := contentMap["text"]; ok {
-						resultText += fmt.Sprintf("%v ", text)
-					}
+				if contentMap, ok := item.(mcp.TextContent); ok {
+					resultText += fmt.Sprintf("%v ", contentMap.Text)
 				}
 			}
 
@@ -435,19 +454,21 @@ func runPrompt(
 	})
 
 	if len(toolResults) > 0 {
-		*messages = append(*messages, history.HistoryMessage{
-			Role:    "user",
-			Content: toolResults,
-		})
+		for _, toolResult := range toolResults {
+			*messages = append(*messages, history.HistoryMessage{
+				Role:    "tool",
+				Content: []history.ContentBlock{toolResult},
+			})
+		}
 		// Make another call to get Claude's response to the tool results
-		return runPrompt(provider, mcpClients, tools, "", messages)
+		return runPrompt(ctx, provider, mcpClients, tools, "", messages)
 	}
 
 	fmt.Println() // Add spacing
 	return nil
 }
 
-func runMCPHost() error {
+func runMCPHost(ctx context.Context) error {
 	// Set up logging based on debug flag
 	if debugMode {
 		log.SetLevel(log.DebugLevel)
@@ -458,8 +479,13 @@ func runMCPHost() error {
 		log.SetReportCaller(false)
 	}
 
+	systemPrompt, err := loadSystemPrompt(systemPromptFile)
+	if err != nil {
+		return fmt.Errorf("error loading system prompt: %v", err)
+	}
+
 	// Create the provider based on the model flag
-	provider, err := createProvider(modelFlag)
+	provider, err := createProvider(ctx, modelFlag, systemPrompt)
 	if err != nil {
 		return fmt.Errorf("error creating provider: %v", err)
 	}
@@ -497,7 +523,7 @@ func runMCPHost() error {
 
 	var allTools []llm.Tool
 	for serverName, mcpClient := range mcpClients {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		toolsResult, err := mcpClient.ListTools(ctx, mcp.ListToolsRequest{})
 		cancel()
 
@@ -531,28 +557,24 @@ func runMCPHost() error {
 
 	// Main interaction loop
 	for {
-		width := getTerminalWidth()
 		var prompt string
-		form := huh.NewForm(
-			huh.NewGroup(
-				huh.NewText().
-					Key("prompt").
-					Title("Enter your prompt (Type /help for commands, Ctrl+C to quit)").
-					Value(&prompt),
-			),
-		).WithWidth(width).WithTheme(huh.ThemeCharm())
+		err := huh.NewForm(huh.NewGroup(huh.NewText().
+			Title("Enter your prompt (Type /help for commands, Ctrl+C to quit)").
+			Value(&prompt).
+			CharLimit(5000)),
+		).WithWidth(getTerminalWidth()).
+			WithTheme(huh.ThemeCharm()).
+			Run()
 
-		err := form.Run()
 		if err != nil {
 			// Check if it's a user abort (Ctrl+C)
-			if err.Error() == "user aborted" {
+			if errors.Is(err, huh.ErrUserAborted) {
 				fmt.Println("\nGoodbye!")
 				return nil // Exit cleanly
 			}
 			return err // Return other errors normally
 		}
 
-		prompt = form.GetString("prompt")
 		if prompt == "" {
 			continue
 		}
@@ -574,9 +596,31 @@ func runMCPHost() error {
 		if len(messages) > 0 {
 			messages = pruneMessages(messages)
 		}
-		err = runPrompt(provider, mcpClients, allTools, prompt, &messages)
+		err = runPrompt(ctx, provider, mcpClients, allTools, prompt, &messages)
 		if err != nil {
 			return err
 		}
 	}
+}
+
+// loadSystemPrompt loads the system prompt from a JSON file
+func loadSystemPrompt(filePath string) (string, error) {
+	if filePath == "" {
+		return "", nil
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("error reading config file: %v", err)
+	}
+
+	// Parse only the systemPrompt field
+	var config struct {
+		SystemPrompt string `json:"systemPrompt"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return "", fmt.Errorf("error parsing config file: %v", err)
+	}
+
+	return config.SystemPrompt, nil
 }
